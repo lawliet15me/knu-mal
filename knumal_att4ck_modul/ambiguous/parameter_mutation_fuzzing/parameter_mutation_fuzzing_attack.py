@@ -142,36 +142,50 @@ _identity_field_cache: Dict[str, Tuple[str, ...]] = {}
 
 def build_identity_field_discovery_prompt(sample_body: str) -> str:
     """Asks the LLM to read ONE response body and name its own identity-
-    bearing top-level field names -- a field-labeling task over a single
-    known document, not a cross-response identity judgment (see the
-    TWO-STAGE ORACLE comment block above for why this task shape was
-    chosen)."""
+    bearing field names (including nested ones) -- a field-labeling task
+    over a single known document, not a cross-response identity judgment
+    (see the TWO-STAGE ORACLE comment block above for why this task shape
+    was chosen).
+
+    NOTE: an earlier version of this prompt ended its answer-format
+    instruction with "...or NONE if there are no identity-bearing fields".
+    Empirically (see project memory / thesis defense Q&A), that single
+    clause made qwen2.5:3b answer NONE for the vast majority of real
+    baseline bodies in this project's dataset -- including ones with
+    obvious top-level identity fields (name, email, salary, employee_id)
+    that the prompt's own examples describe. Removing the NONE escape
+    hatch, dropping the rigid "FIELDS: ..." answer template, and adding
+    concrete ALWAYS-non-identity examples (dynamic/cached/company name)
+    fixed the vast majority of cases in manual testing. A residual failure
+    mode remains: for a body with NO real identity fields, the model can
+    occasionally name fields that don't actually exist in the JSON at all
+    (hallucination) instead of returning empty. This is harmless for
+    classify_data_identity_by_field_diff() below, which only ever checks
+    field PATHS that actually exist in both the baseline and current
+    response -- a hallucinated field name that matches no real path simply
+    never gets checked, so it cannot cause a false VULNERABLE verdict."""
 
     return (
         f"Here is one example JSON response body from an API endpoint:\n{sample_body}\n\n"
-        "List the top-level field names in this JSON whose VALUE reveals "
-        "who a SPECIFIC person is -- e.g. a person's name, email, phone "
+        "Read every field in this JSON, including nested fields.\n\n"
+        "A field is IDENTITY-BEARING only if its value, by itself, tells "
+        "you WHO a specific person is: a person's full name, email, phone "
         "number, physical address, national ID/NIK/KTP, employee ID, "
-        "username, date of birth, salary, bank account number, job "
-        "position/department, or similar personally-identifying data.\n\n"
-        "EXCLUDE every field whose value does NOT by itself tell you which "
-        "person this is -- this includes tokens, hashes, signatures, "
-        "random/opaque strings, timestamps, dates that aren't a birth "
-        "date, booleans, numeric status/counter fields, and any field "
-        "whose NAME suggests it is technical/volatile rather than "
-        "personal (e.g. names containing \"token\", \"hash\", \"dynamic\", "
-        "\"signature\", \"stamp\", \"cache\", \"id\" that is a database "
-        "row id rather than a person's own ID number, \"status\", "
-        "\"success\", \"code\"). A company/organization name (e.g. "
-        "employer name) is NOT a personal identity field either, since "
-        "many different people can share the same employer.\n\n"
-        "When unsure whether a field is personally-identifying, EXCLUDE "
-        "it -- only include fields you are confident single out one "
-        "specific person.\n\n"
-        "Answer with exactly one line in this exact format, a "
-        "comma-separated list of the field names only (no explanation), "
-        "or NONE if there are no identity-bearing fields:\n"
-        "FIELDS: name, email, address"
+        "username, date of birth, salary, bank account number, or job "
+        "position/department.\n\n"
+        "A field is NOT identity-bearing if it is a token, hash, "
+        "signature, random/opaque string, timestamp, boolean (true/false "
+        "flag), counter, status code, or a company/organization name -- "
+        "many different people can share the same employer, so a company "
+        "name never identifies one specific person. This also includes "
+        "any field whose name is technical/volatile, such as fields "
+        "literally named \"dynamic\", \"token\", \"hash\", "
+        "\"cache\"/\"cached\", \"status\", \"code\", \"success\".\n\n"
+        "Examples of fields that are ALWAYS non-identity, regardless of "
+        "their value: \"dynamic\", \"cached\", \"perusahaan\"/\"company\", "
+        "\"status\", \"success\", \"code\".\n\n"
+        "List only the identity-bearing field names, comma-separated. If "
+        "none qualify, reply with an empty response."
     )
 
 
