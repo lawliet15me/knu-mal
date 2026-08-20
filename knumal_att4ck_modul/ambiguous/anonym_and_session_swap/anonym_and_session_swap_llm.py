@@ -114,14 +114,23 @@ def load_response_index() -> Dict[str, str]:
 
 
 def classify_uncertain_row(row: Dict[str, str], baseline_status: str,
-                            response_index: Dict[str, str], context: str = "") -> Tuple[str, Optional[int], Optional[int]]:
+                            response_index: Dict[str, str], context: str = "") -> Tuple[str, Optional[int], Optional[int], bool]:
     """http_status-first, then-LLM logic, mapped to this module's result
     vocabulary: UNAFFECTED / VULNERABLE / LLM_ERROR, plus the raw similarity
     score (None when not applicable; the LLM's confidence score is still
     returned as the 3rd tuple element for callers that want it, but this
-    module no longer uses it -- see llmclass_tools.classify_with_llm()'s docstring).
-    `context` is accepted for backward-compatible call signatures but is no
-    longer used.
+    module no longer uses it -- see llmclass_tools.classify_with_llm()'s docstring),
+    plus a 4th element, context_window_exceeded: True when the prompt sent
+    to Qwen2.5:3B for this row was estimated (llmclass_tools.check_context_window())
+    to exceed its context window BEFORE the call was made. The dataset-level
+    exclusion of known-oversized endpoints (e.g. GET /api/menus, Section
+    4.5) is a MANUAL step performed when the ground truth is built, not
+    something this pipeline enforces on its own (Bab4_experiment_6_agt.txt
+    Section 4.14, Limitation 1) -- this flag exists specifically to catch
+    any oversized endpoint that slips past that manual exclusion, since
+    Ollama itself gives no error when a prompt is silently truncated
+    (Section 4.13.5). `context` is accepted for backward-compatible call
+    signatures but is no longer used.
 
     The similarity score alone decides VULNERABLE vs UNAFFECTED --
     llmclass_tools.SIMILARITY_VULNERABLE_THRESHOLD (90). Ground-truth testing on 40
@@ -131,23 +140,27 @@ def classify_uncertain_row(row: Dict[str, str], baseline_status: str,
     current_status = row.get("current_resp_code", "")
 
     if str(baseline_status) != str(current_status):
-        return "UNAFFECTED", None, None
+        return "UNAFFECTED", None, None, False
 
     baseline_body = response_index.get(row.get("knumal_resp"), "")
     if not baseline_body:
-        return "LLM_ERROR", None, None
+        return "LLM_ERROR", None, None, False
 
-    llm_result, score, confidence = llmclass_tools.classify_with_llm(MODEL, baseline_body, row.get("current_resp_data", ""))
+    llm_result, score, confidence, context_exceeded = llmclass_tools.classify_with_llm(
+        MODEL, baseline_body, row.get("current_resp_data", "")
+    )
+    if context_exceeded:
+        print(f"    [!] {row.get('endpoint', 'UNKNOWN')}: context window exceeded -- see warning above.")
 
     if llm_result == "llm_error":
-        return "LLM_ERROR", score, confidence
+        return "LLM_ERROR", score, confidence, context_exceeded
 
     if llm_result == "unaffected_by_llm":
-        return "UNAFFECTED", score, confidence
+        return "UNAFFECTED", score, confidence, context_exceeded
     if llm_result == "vulnerable_by_llm":
-        return "VULNERABLE", score, confidence
+        return "VULNERABLE", score, confidence, context_exceeded
 
-    return "LLM_ERROR", score, confidence
+    return "LLM_ERROR", score, confidence, context_exceeded
 
 
 def run_standalone(baseline_path: str, tsv_path: str, output_path: Optional[str] = None) -> str:
@@ -172,16 +185,25 @@ def run_standalone(baseline_path: str, tsv_path: str, output_path: Optional[str]
         i: row.get("result", "") for i, row in enumerate(rows) if row.get("result") != "UNCERTAIN"
     }
     similarity_scores: Dict[int, str] = {}
+    # "" for every row not routed through the LLM at all (rule-decided or
+    # UNCERTAIN-but-unprocessed); "YES" only for rows whose prompt was
+    # estimated to exceed Qwen2.5:3B's context window before the call was
+    # made (llmclass_tools.check_context_window(), Section 4.13/4.14).
+    context_exceeded_flags: Dict[int, str] = {}
 
     cancelled = False
+    context_exceeded_count = 0
     if uncertain_indices:
         try:
             for progress, row_idx in enumerate(uncertain_indices, start=1):
                 row = rows[row_idx]
                 status = baseline_status.get(row.get("knumal_req"), "")
-                result, score, _ = classify_uncertain_row(row, status, response_index, context)
+                result, score, _, context_exceeded = classify_uncertain_row(row, status, response_index, context)
                 final_results[row_idx] = result
                 similarity_scores[row_idx] = "-" if score is None else str(score)
+                if context_exceeded:
+                    context_exceeded_flags[row_idx] = "YES"
+                    context_exceeded_count += 1
                 llmclass_tools.render_progress_bar(progress, len(uncertain_indices))
         except KeyboardInterrupt:
             cancelled = True
@@ -189,8 +211,13 @@ def run_standalone(baseline_path: str, tsv_path: str, output_path: Optional[str]
         finally:
             llmclass_tools.unload_ollama_model(MODEL)
 
+    if context_exceeded_count:
+        print(f"\n[!] {context_exceeded_count} row(s) had a prompt estimated to exceed Qwen2.5:3B's "
+              f"context window -- flagged \"YES\" in the context_window_exceeded column below. "
+              f"Their VULNERABLE/UNAFFECTED verdict may be unreliable (Section 4.13/4.14).")
+
     output_path = output_path or f"{os.path.splitext(os.path.basename(tsv_path))[0]}_final.tsv"
-    new_header = header + ["llm_similarity_score", "final_result"]
+    new_header = header + ["llm_similarity_score", "final_result", "context_window_exceeded"]
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t")
         writer.writerow(new_header)
@@ -198,6 +225,7 @@ def run_standalone(baseline_path: str, tsv_path: str, output_path: Optional[str]
             values = [row.get(col, "") for col in header]
             values.append(similarity_scores.get(i, "-"))
             values.append(final_results.get(i, ""))
+            values.append(context_exceeded_flags.get(i, ""))
             writer.writerow(values)
 
     status_word = "Partial" if cancelled else "Final"

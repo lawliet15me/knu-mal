@@ -234,6 +234,7 @@ def build_similarity_prompt(baseline_body: str, current_body: str) -> str:
 def call_ollama(model: str, prompt: str) -> Optional[str]:
     """Returns the raw text response, or None if every attempt failed."""
 
+    last_error: Optional[Exception] = None
     for attempt in range(MAX_LLM_ATTEMPTS):
         try:
             response = requests.post(
@@ -254,10 +255,24 @@ def call_ollama(model: str, prompt: str) -> Optional[str]:
             )
             response.raise_for_status()
             return response.json().get("response", "")
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            last_error = exc
             if attempt < MAX_LLM_ATTEMPTS - 1:
                 time.sleep(LLM_RETRY_DELAY_SECONDS)
 
+    # Every attempt failed -- this is a GENUINE connection/technical failure
+    # (Ollama down, unreachable, timeout), distinct from a successful call
+    # that happens to answer "no fields"/"nothing found". Printed here,
+    # not left silent, so this failure mode is as visible to an operator
+    # as the context-window-exceeded warning is (check_context_window()) --
+    # without this, a caller falling back to a static keyword list (e.g.
+    # discover_identity_fields_by_llm()'s IDENTITY_FIELD_KEYWORDS) would do
+    # so with no on-screen indication anything was wrong.
+    print(
+        f"\n[!] OLLAMA CALL FAILED after {MAX_LLM_ATTEMPTS} attempt(s) ({model}): "
+        f"{type(last_error).__name__}: {last_error}. Falling back to any "
+        f"static/default behavior the caller defines for this condition."
+    )
     return None
 
 
@@ -295,10 +310,72 @@ def parse_similarity_and_confidence(raw: str) -> Tuple[Optional[int], Optional[i
     return similarity, confidence
 
 
-def classify_with_llm(model: str, baseline_body: str, response_body: str) -> Tuple[str, Optional[int], Optional[int]]:
-    """Returns (result, similarity_score, confidence_score) where result is
-    "vulnerable_by_llm" / "unaffected_by_llm" / "llm_error", and both scores
-    are the raw 0-100 values from a SINGLE LLM call (None on parse failure).
+# Qwen2.5:3B's documented context window (Table 4.4/Section 4.4,
+# Bab4_experiment_6_agt.txt). Section 4.13 of that document found the
+# EFFECTIVE runtime limit on the project's scanner machine can be smaller
+# than this (~16,386 tokens observed, most likely due to Ollama's
+# memory-aware automatic context sizing) -- so this constant is used as a
+# conservative, documented upper bound for PRE-FLIGHT flagging purposes,
+# not a guarantee that every prompt under this size is safe on every
+# machine.
+QWEN_CONTEXT_WINDOW_TOKENS = 32768
+
+# Empirical chars-per-token ratio calibrated against this project's own
+# JSON-heavy response bodies via Ollama's own prompt_eval_count (see
+# tools/context_window_experiment.py, Section 4.13.2: measured ratio was
+# ~3.037 chars/token). Rounded down to 3.0 here so the estimate is
+# conservative -- it OVER-estimates token count slightly, making a
+# borderline prompt more likely to be flagged than missed.
+CHARS_PER_TOKEN_ESTIMATE = 3.0
+
+# Headroom reserved under the raw context window for the model's own reply
+# tokens (SIMILARITY/CONFIDENCE lines are short, but this keeps the
+# pre-flight check conservative rather than assuming zero output budget).
+CONTEXT_WINDOW_OUTPUT_RESERVE_TOKENS = 512
+
+
+def estimate_prompt_tokens(prompt: str) -> int:
+    """Rough token-count estimate for a prompt string, calibrated to this
+    project's JSON-heavy response bodies (see CHARS_PER_TOKEN_ESTIMATE's
+    docstring). NOT a substitute for the model's own tokenizer -- used only
+    to flag prompts likely to exceed the context window BEFORE they are
+    sent, since Ollama itself gives no error when a prompt is silently
+    truncated (Bab4_experiment_6_agt.txt Section 4.13.5)."""
+
+    return int(len(prompt) / CHARS_PER_TOKEN_ESTIMATE)
+
+
+def check_context_window(prompt: str, context_window_tokens: int = QWEN_CONTEXT_WINDOW_TOKENS) -> Tuple[bool, int]:
+    """Returns (exceeded, estimated_tokens). exceeded is True when the
+    prompt's ESTIMATED token count leaves no room under
+    context_window_tokens once CONTEXT_WINDOW_OUTPUT_RESERVE_TOKENS is
+    reserved for the model's reply. This is a best-effort PRE-FLIGHT check,
+    not a guarantee -- it exists specifically to accommodate cases where an
+    oversized endpoint slips past manual dataset-level exclusion (Section
+    4.5's GET /api/menus exclusion was manual, not enforced by this
+    pipeline -- see Section 4.14, Limitation 1)."""
+
+    estimated = estimate_prompt_tokens(prompt)
+    exceeded = estimated > (context_window_tokens - CONTEXT_WINDOW_OUTPUT_RESERVE_TOKENS)
+    return exceeded, estimated
+
+
+def classify_with_llm(model: str, baseline_body: str, response_body: str) -> Tuple[str, Optional[int], Optional[int], bool]:
+    """Returns (result, similarity_score, confidence_score, context_window_exceeded)
+    where result is "vulnerable_by_llm" / "unaffected_by_llm" / "llm_error",
+    both scores are the raw 0-100 values from a SINGLE LLM call (None on
+    parse failure), and context_window_exceeded is True when the
+    constructed prompt was estimated (check_context_window()) to exceed
+    Qwen2.5:3B's context window BEFORE the call was made.
+
+    The LLM call is still made even when context_window_exceeded is True --
+    this function does not skip or fall back on its own, it only reports
+    the condition so the caller can flag it in a warning and/or a report
+    column. Section 4.13 (Bab4_experiment_6_agt.txt) demonstrated that
+    Ollama returns a normally-formatted, successfully-parseable response
+    even when the prompt is silently truncated -- so an oversized prompt is
+    otherwise indistinguishable from a legitimate low-similarity case
+    without this pre-flight check.
 
     See build_similarity_prompt()'s docstring for why similarity compares
     the current response against the baseline instead of asking a
@@ -307,16 +384,26 @@ def classify_with_llm(model: str, baseline_body: str, response_body: str) -> Tup
     rather than as a separate follow-up (an earlier separate-call design
     always echoed the similarity score instead of judging independently)."""
 
-    raw = call_ollama(model, build_similarity_prompt(baseline_body, response_body))
+    prompt = build_similarity_prompt(baseline_body, response_body)
+    context_exceeded, estimated_tokens = check_context_window(prompt)
+    if context_exceeded:
+        print(
+            f"\n[!] CONTEXT WINDOW EXCEEDED: prompt ~{estimated_tokens:,} estimated tokens "
+            f"> {QWEN_CONTEXT_WINDOW_TOKENS:,}-token limit ({model}). Proceeding with the "
+            f"call, but the verdict below may be UNRELIABLE -- Ollama truncates silently "
+            f"instead of erroring (see Bab4_experiment_6_agt.txt Section 4.13)."
+        )
+
+    raw = call_ollama(model, prompt)
     if raw is None:
-        return "llm_error", None, None
+        return "llm_error", None, None, context_exceeded
 
     score, confidence = parse_similarity_and_confidence(raw)
     if score is None:
-        return "llm_error", None, confidence
+        return "llm_error", None, confidence, context_exceeded
 
     result = "vulnerable_by_llm" if score >= SIMILARITY_VULNERABLE_THRESHOLD else "unaffected_by_llm"
-    return result, score, confidence
+    return result, score, confidence, context_exceeded
 
 
 def unload_ollama_model(model: str) -> None:
@@ -352,7 +439,7 @@ def classify_row(row: Dict[str, str], baseline_status: str, model: str,
     if not baseline_body:
         return "llm_error"
 
-    result, _score, _confidence = classify_with_llm(model, baseline_body, row.get("current_resp_data", ""))
+    result, _score, _confidence, _context_exceeded = classify_with_llm(model, baseline_body, row.get("current_resp_data", ""))
     return result
 
 

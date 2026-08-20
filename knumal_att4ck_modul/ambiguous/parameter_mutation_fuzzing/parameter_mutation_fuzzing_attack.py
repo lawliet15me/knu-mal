@@ -137,7 +137,8 @@ MODEL = "qwen2.5:3b"
 # actual per-attempt comparison purely in Python against that cached set,
 # exactly like the .old heuristic did against the static keyword tuple.
 
-_identity_field_cache: Dict[str, Tuple[str, ...]] = {}
+# Cached per distinct baseline_hash: (identity_fields tuple, context_window_exceeded).
+_identity_field_cache: Dict[str, Tuple[Tuple[str, ...], bool]] = {}
 
 
 def build_identity_field_discovery_prompt(sample_body: str) -> str:
@@ -207,28 +208,48 @@ def parse_identity_field_list(raw: str) -> Tuple[str, ...]:
     return tuple(field for field in fields if field)
 
 
-def discover_identity_fields_by_llm(baseline_hash: str, baseline_body: str) -> Tuple[str, ...]:
-    """Returns the cached (or newly discovered) tuple of identity-bearing
-    field NAMES for this baseline, used by is_identity_field() in place of
-    the static IDENTITY_FIELD_KEYWORDS tuple. One LLM call per distinct
-    baseline_hash, cached for the lifetime of the process -- NOT one call
-    per mutation attempt (see TWO-STAGE ORACLE comment block above).
-    Falls back to the static IDENTITY_FIELD_KEYWORDS tuple if the LLM call
-    or parse fails, so a transient Ollama error doesn't silently disable
-    Stage 2 for that endpoint."""
+def discover_identity_fields_by_llm(baseline_hash: str, baseline_body: str) -> Tuple[Tuple[str, ...], bool]:
+    """Returns (identity_fields, context_window_exceeded) -- the cached (or
+    newly discovered) tuple of identity-bearing field NAMES for this
+    baseline, used by is_identity_field() in place of the static
+    IDENTITY_FIELD_KEYWORDS tuple, plus a flag that is True when the
+    baseline_body alone was estimated (llmclass_tools.check_context_window())
+    to produce a prompt exceeding Qwen2.5:3B's context window BEFORE the
+    call was made. One LLM call per distinct baseline_hash, cached (fields
+    AND the flag) for the lifetime of the process -- NOT one call per
+    mutation attempt (see TWO-STAGE ORACLE comment block above). Falls back
+    to the static IDENTITY_FIELD_KEYWORDS tuple if the LLM call or parse
+    fails, so a transient Ollama error doesn't silently disable Stage 2 for
+    that endpoint -- but context_window_exceeded is still reported
+    truthfully in that case, since a truncated prompt is a distinct failure
+    mode from a connection error (Bab4_experiment_6_agt.txt Section 4.13.5,
+    4.14 Limitation 1: this check exists to catch an oversized endpoint
+    that slips past the manual dataset-level exclusion of known cases like
+    GET /api/menus)."""
 
     if baseline_hash in _identity_field_cache:
         return _identity_field_cache[baseline_hash]
 
     prompt = build_identity_field_discovery_prompt(baseline_body)
+    context_exceeded, estimated_tokens = llmclass_tools.check_context_window(prompt)
+    if context_exceeded:
+        print(
+            f"\n[!] CONTEXT WINDOW EXCEEDED: identity-field discovery prompt for baseline "
+            f"{baseline_hash[:12]}... ~{estimated_tokens:,} estimated tokens > "
+            f"{llmclass_tools.QWEN_CONTEXT_WINDOW_TOKENS:,}-token limit ({MODEL}). Proceeding "
+            f"with the call, but discovered field names below may be UNRELIABLE (Ollama "
+            f"truncates silently instead of erroring -- see Bab4_experiment_6_agt.txt "
+            f"Section 4.13)."
+        )
+
     raw = llmclass_tools.call_ollama(MODEL, prompt)
 
     fields = parse_identity_field_list(raw) if raw is not None else ()
     if not fields:
         fields = IDENTITY_FIELD_KEYWORDS
 
-    _identity_field_cache[baseline_hash] = fields
-    return fields
+    _identity_field_cache[baseline_hash] = (fields, context_exceeded)
+    return fields, context_exceeded
 
 
 # Fallback keyword list, used only when the per-baseline LLM discovery call
@@ -882,9 +903,15 @@ def get_extra_columns() -> List[str]:
         (empty if none).
       - value_test: "key=min-max,key2=min-max" -- the full range of values
         actually attempted for each fuzzable parameter on this endpoint,
-        regardless of outcome (documents test coverage)."""
+        regardless of outcome (documents test coverage).
+      - context_window_exceeded: "YES" if the Stage 2 identity-field
+        discovery prompt for this endpoint's baseline was estimated to
+        exceed Qwen2.5:3B's context window before the call was made, ""
+        otherwise (including endpoints resolved entirely by Stage 1 or
+        UNCERTAIN, which never reach Stage 2 -- see evaluate() and
+        discover_identity_fields_by_llm(), Section 4.13/4.14)."""
 
-    return ["parameter_affected", "value_test"]
+    return ["parameter_affected", "value_test", "context_window_exceeded"]
 
 
 def evaluate(plan: Dict[str, Any], attack_result: "engine.AttackResult", response_index: Dict[str, str],
@@ -932,6 +959,8 @@ def evaluate(plan: Dict[str, Any], attack_result: "engine.AttackResult", respons
     fuzz_mutated = record.get("_fuzz_mutated_value", "")
     fuzz_mutation_kind = record.get("_fuzz_mutation_kind", "")
 
+    context_window_exceeded = ""
+
     if not baseline_body:
         result = "UNCERTAIN"
         similarity_score = "-"
@@ -953,7 +982,8 @@ def evaluate(plan: Dict[str, Any], attack_result: "engine.AttackResult", respons
             # Stage 2: structure matches. Get (or discover, once per
             # baseline) this endpoint's identity-bearing field names, then
             # run the deterministic field-diff heuristic against them.
-            identity_fields = discover_identity_fields_by_llm(baseline_hash, baseline_body)
+            identity_fields, exceeded = discover_identity_fields_by_llm(baseline_hash, baseline_body)
+            context_window_exceeded = "YES" if exceeded else ""
             diff_result, score, _confidence = classify_data_identity_by_field_diff(
                 baseline_body, attack_result.response_body, identity_fields
             )
@@ -995,6 +1025,7 @@ def evaluate(plan: Dict[str, Any], attack_result: "engine.AttackResult", respons
         "result": result,
         "description": description,
         "error": None,
+        "context_window_exceeded": context_window_exceeded,
     }
 
 
@@ -1079,6 +1110,15 @@ def _build_endpoint_summary_row(attempts: List[Dict[str, Any]]) -> Dict[str, Any
     summary["parameter_affected"] = parameter_affected
     summary["value_test"] = value_test
     summary["result"] = result
+    # Not simply inherited from attempts[0]: different (parameter, fuzz
+    # value) attempts on the SAME endpoint can differ in whether they
+    # reached Stage 2 at all (Stage 1 structural mismatch short-circuits
+    # some attempts, not others), so this must be an OR across every
+    # attempt rather than copied from whichever attempt happens to be
+    # first in the list.
+    summary["context_window_exceeded"] = "YES" if any(
+        a.get("context_window_exceeded") == "YES" for a in attempts
+    ) else ""
     summary["description"] = description
 
     return summary
